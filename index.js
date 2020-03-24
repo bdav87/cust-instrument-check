@@ -18,18 +18,21 @@ axios.defaults.baseURL = bc.baseURL;
     const csvStream = csv.format({headers: true});
     csvStream.pipe(writableStream);
 
-    fs.createReadStream('./customers.csv')
+    // Put the CSV filename here
+    fs.createReadStream('./example.csv')
         .pipe(csv.parse({ headers: true }))
         .on('error', error => console.error(error))
         .on('data', row => customerArray.push({
-            customerId: parseInt(row['Merchant User ID']),
+            customerId: row['Merchant User ID'],
+            orderGrooveId: row['OG User ID'],
+            orderGrooveSub: row['OG Subscription ID'],
             orderId: 0,
             storedInstruments: 0
         }))
         .on('end', () => checkOrders(customerArray, 0));
 
     function checkOrders(customers, counter) {
-        let endCounter = counter + 20;
+        let endCounter = counter + 100;
 
         if (customers.length <= counter) {
             console.log(`Counter is at ${counter}. Total customers is ${customers.length}`)
@@ -54,35 +57,51 @@ axios.defaults.baseURL = bc.baseURL;
     }
 
     function getCustomerOrder(customerId) {
-        if (typeof customerId !== 'number') {
+        // Check for non-integer values passed as customer id
+        if (customerId * 0 !== 0) {
             console.log('cust id was not a number', customerId);
-            return axios.get(`v2/orders?customer_id=0&status_id=0&sort=date_created:desc&limit=1`)
+            return false;
         }
-        return axios.get(`v2/orders?customer_id=${customerId}&status_id=0&sort=date_created:desc&limit=1`)
+        return axios.get(`v2/orders?customer_id=${customerId}&status_id=0&sort=date_created:desc&limit=1`, { validateStatus: () => true });
     }
 
     function identifyIncompleteOrders(requests, counter) {
-        axios.all(requests)
+        // First clear requests array of any non-requests
+        const filteredRequests = requests.filter(req => req !== false);
+
+        axios.all(filteredRequests)
             .then(axios.spread((...responses) => {
                 responses.forEach(response => filterOrderResponse(response))
             }))
             .then(() => {
-                checkOrders(customerArray, counter)
+                //Wait a sec
+                setTimeout(checkOrders, 1000, customerArray, counter); 
             })
-            .catch(err => console.error(err))
+            .catch(err => {
+                if (!err.response) {
+                    console.log("Network error")
+                };
+                return false;
+            })
     }
 
     function filterOrderResponse(response) {
-        if (response.status === 200) {    
-            const customerId = response.data[0].customer_id;
-            const orderId = response.data[0].id;
-            associateOrderWithCustomer(customerId, orderId);
+        if (response.status === 200) {
+            if (response.data[0]) {
+                const customerId = response.data[0].customer_id;
+                const orderId = response.data[0].id;
+                associateOrderWithCustomer(customerId, orderId);
+            } else {
+                console.log('Unusual response data:', response.data)
+            }
+        } else {
+            console.log(response.status);
         }
     }
 
     function associateOrderWithCustomer(customerId, orderId) {
         for (i = 0; i < customerArray.length; i++) {
-            if (customerArray[i].customerId === customerId) {
+            if (parseInt(customerArray[i].customerId) === customerId) {
                 customerArray[i].orderId = orderId;
             }
         }
@@ -91,7 +110,7 @@ axios.defaults.baseURL = bc.baseURL;
     // Similar pattern as checkOrders()
     // iterate over customers order IDs and pull payment methods
     function checkPaymentMethods(customers, counter) {
-        let endCounter = counter + 10;
+        let endCounter = counter + 100;
 
         if (customers.length <= counter) {
             //kick off function to write results to csv
@@ -133,8 +152,16 @@ axios.defaults.baseURL = bc.baseURL;
             .then(axios.spread((...responses) => {
                 responses.forEach(response => filterPaymentMethod(response))
             }))
-            .then(() => checkPaymentMethods(customerArray, counter))
-            .catch(err => console.log('hmm', err))
+            .then(() => {
+                // Wait a sec before next batch of orders
+                setTimeout(checkPaymentMethods, 1000, customerArray, counter);
+            })
+            .catch(err => {
+                if (!err.response) {
+                    console.log("Network error")
+                };
+                return false;
+            });
     }
 
     function filterPaymentMethod(response) {
@@ -166,6 +193,8 @@ axios.defaults.baseURL = bc.baseURL;
        return {
            'BC Customer ID': customer.customerId,
            'BC Order ID': orderId,
+           'OG User ID': customer.orderGrooveId,
+           'OG Subscription ID': customer.orderGrooveSub,
            'Saved Instrument Count': storedInstruments
        }
    }
