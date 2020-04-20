@@ -15,7 +15,7 @@ axios.defaults.baseURL = bc.baseURL;
     const date = new Date().toDateString().split(' ').join('_');
     const filename = `customersWithInstruments-${date}.csv`;
     const writableStream = fs.createWriteStream(filename);
-    const csvStream = csv.format({headers: true});
+    const csvStream = csv.format({ headers: true });
     csvStream.pipe(writableStream);
 
     // Put the CSV filename here
@@ -24,10 +24,13 @@ axios.defaults.baseURL = bc.baseURL;
         .on('error', error => console.error(error))
         .on('data', row => customerArray.push({
             customerId: row['Merchant User ID'],
-            orderGrooveId: row['OG User ID'],
-            orderGrooveSub: row['OG Subscription ID'],
+            email: '',
             orderId: 0,
-            storedInstruments: 0
+            dateCreated: '',
+            transactionId: '',
+            storedInstruments: 0,
+            paypalVaulted: false,
+            address: 'No Shipping Address'
         }))
         .on('end', () => checkOrders(customerArray, 0));
 
@@ -35,9 +38,14 @@ axios.defaults.baseURL = bc.baseURL;
         let endCounter = counter + 100;
 
         if (customers.length <= counter) {
-            console.log(`Counter is at ${counter}. Total customers is ${customers.length}`)
+            console.log(`Counter is at ${counter}. Total customers is ${customers.length}`);
             // Here is where to shift to the next phase after orders have been identified
-            return checkPaymentMethods(customerArray, 0)
+            if (process.env.PAYMENT == 'true') {
+                return checkPaymentMethods(customerArray, 0)
+            } else {
+                return writeToCSV(customers)
+            }
+
         }
 
         if (endCounter > customers.length) {
@@ -75,22 +83,21 @@ axios.defaults.baseURL = bc.baseURL;
             }))
             .then(() => {
                 //Wait a sec
-                setTimeout(checkOrders, 1000, customerArray, counter); 
+                setTimeout(checkOrders, 1000, customerArray, counter);
             })
             .catch(err => {
                 if (!err.response) {
-                    console.log("Network error")
+                    console.log("Network error, trying again")
                 };
-                return false;
+                setTimeout(identifyIncompleteOrders, 1000, requests, counter);
             })
     }
 
     function filterOrderResponse(response) {
         if (response.status === 200) {
             if (response.data[0]) {
-                const customerId = response.data[0].customer_id;
-                const orderId = response.data[0].id;
-                associateOrderWithCustomer(customerId, orderId);
+                const responseData = response.data[0];
+                associateOrderWithCustomer(responseData);
             } else {
                 console.log('Unusual response data:', response.data)
             }
@@ -99,10 +106,12 @@ axios.defaults.baseURL = bc.baseURL;
         }
     }
 
-    function associateOrderWithCustomer(customerId, orderId) {
+    function associateOrderWithCustomer(responseData) {
         for (i = 0; i < customerArray.length; i++) {
-            if (parseInt(customerArray[i].customerId) === customerId) {
-                customerArray[i].orderId = orderId;
+            if (parseInt(customerArray[i].customerId) === responseData.customer_id) {
+                customerArray[i].orderId = responseData.id;
+                customerArray[i].transactionId = responseData.payment_provider_id;
+                customerArray[i].dateCreated = responseData.date_created;
             }
         }
     }
@@ -113,8 +122,13 @@ axios.defaults.baseURL = bc.baseURL;
         let endCounter = counter + 100;
 
         if (customers.length <= counter) {
-            //kick off function to write results to csv
-            writeToCSV(customers);
+            // Check option to pull addresses, otherwise write to CSV and exit
+            if (process.env.ADDRESS == 'true') {
+                checkAddresses(customers, 0);
+            } else {
+                writeToCSV(customers);
+            }
+
         }
         if (endCounter > customers.length) {
             endCounter = customers.length;
@@ -158,9 +172,9 @@ axios.defaults.baseURL = bc.baseURL;
             })
             .catch(err => {
                 if (!err.response) {
-                    console.log("Network error")
+                    console.log("Network error, trying again")
                 };
-                return false;
+                setTimeout(identifyStoredInstruments, 1000, requests, counter);
             });
     }
 
@@ -169,35 +183,203 @@ axios.defaults.baseURL = bc.baseURL;
             const param = '?order_id=';
             const i = response.config.url.indexOf('?order_id=');
             const orderId = parseInt(response.config.url.slice(i + param.length));
-            let methods = response.data['data'].map(method => {
+            // Determine if the customer has PayPal vaulted
+            let paypalPresent = checkPaypal(response.data['data']);
+            // Sum total stored payments for customer
+            let methodsLength = response.data['data'].map(method => {
                 return method.stored_instruments.length;
             });
-            const totalInstruments = methods.reduce((total, num) => total += num);
-            assignInstrumentCountsToCustomer(totalInstruments, orderId);
+            const totalInstruments = methodsLength.reduce((total, num) => total += num);
+            assignInstrumentCountsToCustomer(totalInstruments, orderId, paypalPresent);
         } else {
             console.log(response.status)
         }
     }
 
-    function assignInstrumentCountsToCustomer(totalInstruments, orderId) {
+    function assignInstrumentCountsToCustomer(totalInstruments, orderId, paypal) {
         for (i = 0; i < customerArray.length; i++) {
             if (customerArray[i].orderId === orderId) {
                 customerArray[i].storedInstruments = totalInstruments;
+                customerArray[i].paypalVaulted = paypal;
             }
         }
     }
 
-   function formatForCSV(customer) {
-       const orderId = customer.orderId === 0 ? 'No incomplete orders' : customer.orderId;
-       const storedInstruments = customer.storedInstruments === 0 ? 'No saved payments' : customer.storedInstruments;
-       return {
-           'BC Customer ID': customer.customerId,
-           'BC Order ID': orderId,
-           'OG User ID': customer.orderGrooveId,
-           'OG Subscription ID': customer.orderGrooveSub,
-           'Saved Instrument Count': storedInstruments
-       }
-   }
+    function checkPaypal(methods) {
+        // check length of stored_instruments on methods with id braintree.paypal
+        let payPal = false;
+        methods.forEach(method => {
+            if (method.id === 'braintree.paypal' && method.stored_instruments.length > 0) {
+                console.log('paypal is present')
+                payPal = true;
+            }
+        })
+        return payPal;
+    }
+
+    // Get all shipping addresses for inclusion in the CSV
+    function checkAddresses(customers, counter) {
+        let endCounter = counter + 100;
+
+        if (customers.length <= counter) {
+            // Check option to pull emails, otherwise write to CSV and exit
+            if (process.env.EMAIL == 'true') {
+                checkEmails(customers, 0);
+            } else {
+                writeToCSV(customers);
+            }
+        }
+        if (endCounter > customers.length) {
+            endCounter = customers.length;
+        }
+
+        let segment = [counter, endCounter];
+
+        let customerAddressRequestArray = [];
+        console.log('check address batch', segment);
+        for (i = segment[0]; i < segment[1]; i++) {
+            if (!customers[i].orderId) {
+                customers[i].orderId = 0;
+            }
+            customerAddressRequestArray.push(getCustomerAddress(customers[i].customerId));
+            // When loop is done populating with axios requests, start filtering them
+            if (customerAddressRequestArray.length === segment[1] - segment[0]) {
+                requestCustomerAddresses(customerAddressRequestArray, endCounter);
+            }
+        }
+    }
+
+    function getCustomerAddress(customerId) {
+        if (customerId * 0 !== 0) {
+            console.log('cust id was not a number', customerId);
+            return false;
+        }
+        return axios.get(`v2/customers/${customerId}/addresses`, { validateStatus: () => true });
+    }
+
+    function requestCustomerAddresses(requests, counter) {
+        // First clear requests array of any non-requests
+        const filteredRequests = requests.filter(req => req !== false);
+        const idRegex = /\/customers\/(\d+)/;
+        axios.all(filteredRequests)
+            .then(axios.spread((...responses) => {
+                responses.forEach(response => {
+                    if (response.status === 200) {
+                        const url = response.config.url;
+                        const customerId = url.match(idRegex)[1];
+                        const address = response.data;
+                        console.log('cust ID regexed to:', customerId);
+                        applyAddressToCustomer(customerId, address);
+                    } else {
+                        console.log(response.status);
+                    }
+                })
+            }))
+            .then(() => {
+                // Wait a sec before next batch of orders
+                setTimeout(checkAddresses, 1000, customerArray, counter);
+            })
+            .catch(err => {
+                if (!err.response) {
+                    console.log("Network error, trying again")
+                };
+                setTimeout(requestCustomerAddresses, 1000, requests, counter);
+            });
+    }
+
+    function applyAddressToCustomer(customerId, address) {
+        for (i = 0; i < customerArray.length; i++) {
+            if (customerArray[i].customerId === customerId) {
+                customerArray[i].address = JSON.stringify(address);
+            }
+        }
+    }
+
+    // Get all customer email addresses for inclusion in the CSV
+    function checkEmails(customers, counter) {
+        let endCounter = counter + 100;
+
+        if (customers.length <= counter) {
+            //kick off function to write results to csv
+            writeToCSV(customers);
+        }
+        if (endCounter > customers.length) {
+            endCounter = customers.length;
+        }
+
+        let segment = [counter, endCounter];
+
+        let customerEmailRequestArray = [];
+        console.log('check email batch', segment);
+        for (i = segment[0]; i < segment[1]; i++) {
+            customerEmailRequestArray.push(getCustomerEmail(customers[i].customerId));
+            // When loop is done populating with axios requests, start filtering them
+            if (customerEmailRequestArray.length === segment[1] - segment[0]) {
+                requestCustomerEmailBatch(customerEmailRequestArray, endCounter);
+            }
+        }
+    }
+
+    function getCustomerEmail(customerId) {
+        if (customerId * 0 !== 0) {
+            console.log('cust id was not a number', customerId);
+            return false;
+        }
+        return axios.get(`v2/customers/${customerId}`, { validateStatus: () => true });
+    }
+
+    function requestCustomerEmailBatch(requests, counter) {
+        // First clear requests array of any non-requests
+        const filteredRequests = requests.filter(req => req !== false);
+        const idRegex = /\/customers\/(\d+)/;
+        axios.all(filteredRequests)
+            .then(axios.spread((...responses) => {
+                responses.forEach(response => {
+                    if (response.status === 200) {
+                        const url = response.config.url;
+                        const customerId = url.match(idRegex)[1];
+                        const email = response.data.email;
+                        console.log('cust ID regexed to:', customerId);
+                        applyEmailToCustomer(customerId, email);
+                    } else {
+                        console.log(response.status);
+                    }
+                })
+            }))
+            .then(() => {
+                // Wait a sec before next batch of orders
+                setTimeout(checkEmails, 1000, customerArray, counter);
+            })
+            .catch(err => {
+                if (!err.response) {
+                    console.log("Network error, trying again")
+                };
+                setTimeout(requestCustomerEmailBatch, 1000, requests, counter);
+            });
+    }
+
+    function applyEmailToCustomer(customerId, email) {
+        for (i = 0; i < customerArray.length; i++) {
+            if (customerArray[i].customerId === customerId) {
+                customerArray[i].email = email;
+            }
+        }
+    }
+
+    function formatForCSV(customer) {
+        const orderId = customer.orderId === 0 ? 'No incomplete orders' : customer.orderId;
+        const storedInstruments = customer.storedInstruments === 0 ? 'No saved payments' : customer.storedInstruments;
+        return {
+            'BC Customer ID': customer.customerId,
+            'BC Customer Email': customer.email,
+            'BC Order ID': orderId,
+            'BC Order Transaction ID': customer.transactionId,
+            'BC Order Date': customer.dateCreated,
+            'Saved Instrument Count': storedInstruments,
+            'PayPal Saved': customer.paypalVaulted,
+            'Shipping Address': customer.address
+        }
+    }
 
     function writeToCSV(customers) {
         customers.forEach(customer => {
@@ -206,5 +388,3 @@ axios.defaults.baseURL = bc.baseURL;
         console.log('did it?')
     }
 }());
-
-
